@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 r"""Convert every video in a folder to 720p, leaving the originals untouched.
 
-Pick a folder (a dialog opens, or pass the path as an argument). Each video that is
-larger than 720p is downscaled and saved as "<name>_720p" in a "720p" subfolder
-inside that folder. Videos that are already 720p or smaller are skipped, and so are
-videos converted on an earlier run, so it is safe to run the script again.
+Pick a folder (a dialog opens, or pass the path as an argument). Each video in it or
+in its subfolders that is larger than 720p is downscaled and saved as "<name>_720p"
+in a "720p" folder inside the chosen folder, with the same subfolder layout:
+    Holiday\beach.mp4        ->  Holiday\720p\beach_720p.mp4
+    Holiday\Day 2\boat.mov   ->  Holiday\720p\Day 2\boat_720p.mov
+Videos that are already 720p or smaller are skipped, and so are videos converted on
+an earlier run, so it is safe to run the script again.
 
 Scaling uses ffmpeg's "area" filter, which averages the light over each new, larger
 pixel the way a 720p camera sensor does; in testing it came out closest to footage
@@ -32,6 +35,7 @@ from pathlib import Path
 
 OUTPUT_FOLDER = "720p"  # created inside the chosen folder
 SUFFIX = "_720p"  # clip.mov -> 720p/clip_720p.mov
+INCLUDE_SUBFOLDERS = True  # False = only the videos directly in the chosen folder
 CRF_H264 = 18  # quality for normal video: lower = better and bigger (18 ~ visually lossless)
 CRF_HEVC = 20  # quality for HDR video (e.g. iPhone HDR), which stays 10-bit HDR (HEVC)
 PRESET_H264 = "slow"  # slower presets give smaller files at the same quality
@@ -239,16 +243,33 @@ def move_into_place(tmp, dst):
             time.sleep(0.5)
 
 
+def find_videos(folder):
+    """Video files in the folder (and its subfolders), listed folder by folder."""
+    videos = []
+    for current, subfolders, files in os.walk(folder):
+        # Don't descend into 720p output folders (ours, or from runs on a subfolder),
+        # hidden folders, or Windows system folders on drives and memory cards.
+        subfolders[:] = sorted((d for d in subfolders if INCLUDE_SUBFOLDERS
+                                and d.lower() != OUTPUT_FOLDER.lower()
+                                and not d.startswith((".", "$")) and d != "System Volume Information"),
+                               key=str.lower)
+        for name in sorted(files, key=str.lower):
+            # Names starting with "." are hidden files, e.g. macOS "._clip.mov" helper files.
+            if Path(name).suffix.lower() in VIDEO_EXTENSIONS and not name.startswith("."):
+                videos.append(Path(current) / name)
+    return videos
+
+
 def plan_output_names(videos):
-    """Map each video to its output file name, keeping names unique (clip.mp4 + clip.avi)."""
+    """Map each video to its output file name, unique per folder (clip.mp4 + clip.avi)."""
     names, used = {}, set()
     # Videos whose container is kept get first pick of the plain "<name>_720p" name.
-    for src in sorted(videos, key=lambda p: (p.suffix.lower() not in MUXERS, p.name.lower())):
+    for src in sorted(videos, key=lambda p: (p.suffix.lower() not in MUXERS, str(p).lower())):
         ext = src.suffix.lower() if src.suffix.lower() in MUXERS else ".mp4"
         name = f"{src.stem}{SUFFIX}{ext}"
-        if name.lower() in used:
+        if (src.parent, name.lower()) in used:
             name = f"{src.stem}_{src.suffix.lower().lstrip('.')}{SUFFIX}{ext}"
-        used.add(name.lower())
+        used.add((src.parent, name.lower()))
         names[src] = name
     return names
 
@@ -287,21 +308,21 @@ def main():
         print(f"Not a folder: {folder}")
         return 1
 
-    videos = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-              and not p.name.startswith(".")]  # skips macOS "._clip.mov" helper files
-    videos.sort(key=lambda p: p.name.lower())
+    videos = find_videos(folder)
+    where = " and its subfolders" if INCLUDE_SUBFOLDERS else ""
     if not videos:
-        print(f"No video files found in {folder}")
+        print(f"No video files found in {folder}{where}")
         return 0
     out_dir = folder / OUTPUT_FOLDER
     names = plan_output_names(videos)
-    print(f"Found {len(videos)} video(s) in {folder}\nSaving 720p copies to {out_dir}\n")
+    print(f"Found {len(videos)} video(s) in {folder}{where}\nSaving 720p copies to {out_dir}\n")
 
     converted, small, existing, unreadable, failed = [], [], [], [], []
     started = time.time()
     for number, src in enumerate(videos, 1):
-        dst = out_dir / names[src]
-        prefix = f"[{number}/{len(videos)}] {src.name}"
+        relative = src.relative_to(folder)
+        dst = out_dir / relative.parent / names[src]  # same subfolder layout inside 720p
+        prefix = f"[{number}/{len(videos)}] {relative}"
         if dst.exists():
             print(f"{prefix}: already converted, skipped")
             existing.append(src)
@@ -319,7 +340,7 @@ def main():
             small.append(src)
             continue
 
-        out_dir.mkdir(exist_ok=True)
+        dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_name(dst.stem + ".partial" + dst.suffix)
         cmd, codec_label = build_command(ffmpeg, src, tmp, info, video, size, scaler, encoders)
         interlaced = ", deinterlaced" if video.get("field_order") in INTERLACED else ""
@@ -335,7 +356,7 @@ def main():
                 move_into_place(tmp, dst)
                 stat = src.stat()
                 os.utime(dst, (stat.st_atime, stat.st_mtime))  # keep the original date
-                print(f"      done in {clock(time.time() - file_started)} -> {dst.name}")
+                print(f"      done in {clock(time.time() - file_started)} -> {dst.relative_to(folder)}")
                 converted.append(src)
             else:
                 reason = " | ".join(error_text.splitlines()[-3:]) or f"ffmpeg stopped (exit code {code})"
@@ -354,9 +375,9 @@ def main():
           f"{len(small)} already 720p or smaller, {len(existing)} converted earlier, "
           f"{len(unreadable)} unreadable, {len(failed)} failed.")
     for src in unreadable:
-        print(f"  unreadable: {src.name}")
+        print(f"  unreadable: {src.relative_to(folder)}")
     for src in failed:
-        print(f"  failed: {src.name}")
+        print(f"  failed: {src.relative_to(folder)}")
     return 1 if failed or unreadable else 0
 
 
