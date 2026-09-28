@@ -14,8 +14,9 @@ pixel the way a 720p camera sensor does; in testing it came out closest to foota
 shot natively at 720p. Use --scaler spline36 (or lanczos) for a slightly crisper look.
 
 How to run it on Windows:
-    1. Install Python (python.org) and ffmpeg (in PowerShell: winget install Gyan.FFmpeg).
-       Instead of winget you can also put ffmpeg.exe and ffprobe.exe next to this script.
+    1. Install Python (python.org). The script also needs ffmpeg; if it isn't installed
+       yet, the script offers to install it for you with winget. (Or install it yourself:
+       winget install Gyan.FFmpeg, or put ffmpeg.exe and ffprobe.exe next to this script.)
     2. Double-click this file and choose the folder, or drag a folder onto this file,
        or run it from a terminal:
            py convert_to_720p.py "D:\Videos\Holiday"
@@ -50,20 +51,79 @@ INTERLACED = {"tt", "bb", "tb", "bt"}
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}  # HDR10 / HLG
 
 
+WINDOWS_FFMPEG_HELP = r"""ffmpeg was not found. Install it in one of these ways, then run this script again:
+  - Open PowerShell (Start menu, type "PowerShell") and run:   winget install Gyan.FFmpeg
+  - Or download "ffmpeg-release-essentials.zip" from https://www.gyan.dev/ffmpeg/builds/ ,
+    unzip it and copy ffmpeg.exe and ffprobe.exe from its "bin" folder next to this script."""
+
+
+def windows_ffmpeg_folders():
+    """Folders where ffmpeg usually ends up on Windows. Checked as well as this window's PATH,
+    which does not include programs installed after the window was opened."""
+    folders = []
+    try:
+        import winreg
+
+        # The PATH as saved right now (winget and other installers add ffmpeg's folder there).
+        for root, key in ((winreg.HKEY_CURRENT_USER, "Environment"),
+                          (winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")):
+            try:
+                with winreg.OpenKey(root, key) as handle:
+                    value = winreg.QueryValueEx(handle, "Path")[0]
+            except OSError:
+                continue
+            folders += [folder for folder in os.path.expandvars(value).split(";") if folder]
+    except ImportError:
+        pass
+    home = Path.home()
+    local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+    program_files = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
+    folders += [local / "Microsoft" / "WinGet" / "Links", program_files / "WinGet" / "Links",
+                home / "scoop" / "shims", Path(r"C:\ProgramData\chocolatey\bin"),
+                Path(r"C:\ffmpeg\bin"), program_files / "ffmpeg" / "bin"]
+    # winget's package folders, and a zip unzipped in Downloads or on the Desktop,
+    # e.g. Downloads\ffmpeg-release-essentials\ffmpeg-8.0-essentials_build\bin
+    for base, pattern in ((local / "Microsoft" / "WinGet" / "Packages", "*FFmpeg*/*/bin"),
+                          (program_files / "WinGet" / "Packages", "*FFmpeg*/*/bin"),
+                          (home / "Downloads", "ffmpeg*/bin"), (home / "Downloads", "ffmpeg*/*/bin"),
+                          (home / "Desktop", "ffmpeg*/bin"), (home / "Desktop", "ffmpeg*/*/bin")):
+        folders += sorted(base.glob(pattern), reverse=True)  # newest version first
+    return folders
+
+
 def find_tool(name):
-    """Return the path of ffmpeg/ffprobe: on the PATH, next to this script, or from winget."""
+    """Path of ffmpeg/ffprobe: on the PATH, next to this script, or where Windows installs put it."""
     found = shutil.which(name)
     if found:
         return found
     exe = name + (".exe" if os.name == "nt" else "")
-    places = [Path(__file__).resolve().parent]
-    if os.environ.get("LOCALAPPDATA"):
-        # winget's install folder; lets a double-click work before Windows refreshes the PATH
-        places.append(Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "WinGet" / "Links")
-    for place in places:
-        if (place / exe).is_file():
-            return str(place / exe)
+    folders = [Path(__file__).resolve().parent]
+    if os.name == "nt":
+        folders += windows_ffmpeg_folders()
+    for folder in folders:
+        candidate = Path(folder) / exe
+        if candidate.is_file():
+            return str(candidate)
     return None
+
+
+def install_ffmpeg_with_winget():
+    """Offer to install ffmpeg with winget, Windows' own app installer. True if it ran."""
+    if sys.stdin is None or not sys.stdin.isatty():
+        return False
+    answer = input("This script needs ffmpeg, the free program that does the conversion, and it is not\n"
+                   "installed. Install it now with winget (Gyan.FFmpeg)? [Y/n] ").strip().lower()
+    if answer not in ("", "y", "yes"):
+        return False
+    try:
+        subprocess.run(["winget", "install", "--id", "Gyan.FFmpeg", "--exact",
+                        "--accept-source-agreements", "--accept-package-agreements"])
+    except FileNotFoundError:
+        print("winget is not available on this PC.")
+        return False
+    print()
+    return True
 
 
 def choose_folder():
@@ -284,9 +344,11 @@ def main():
         sys.stdout.reconfigure(errors="replace")
 
     ffmpeg, ffprobe = find_tool("ffmpeg"), find_tool("ffprobe")
+    if (not ffmpeg or not ffprobe) and os.name == "nt" and install_ffmpeg_with_winget():
+        ffmpeg, ffprobe = find_tool("ffmpeg"), find_tool("ffprobe")
     if not ffmpeg or not ffprobe:
-        how = "winget install Gyan.FFmpeg" if os.name == "nt" else "brew/apt install ffmpeg"
-        print(f"ffmpeg was not found. Install it (for example:  {how}), then run this again.")
+        print(WINDOWS_FFMPEG_HELP if os.name == "nt" else
+              "ffmpeg was not found. Install it (macOS: brew install ffmpeg, Linux: sudo apt install ffmpeg).")
         return 1
     encoders = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
     if "libx264" not in encoders:
